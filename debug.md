@@ -132,3 +132,215 @@ token 走 `GH_TOKEN` 环境变量，让 `cascading.py` 里用 `os.environ["GH_TO
 有一点行为变化需要注意：`cascading.py` 改成在 PR 已存在时也写出 outputs，所以重跑时 Auto PR Merge 也会作用到已有的 PR 上。如果不想要这个效果，在条件里加上 `&& steps.cascading_merge.outputs.pr_created == 'true'` 就行。
 
 另外，`pip_trusted_host` 的描述在截图里被截断了，我按意思补全的，请核对一下措辞。
+
+先更正上一轮的一个错误：**第 1 条（`[ -z ... ] && unset` 会让 step 退出）是我说错了。** bash 的 `set -e` 对 `&&` 链有豁免：只有最后一个 `&&` 之后的命令失败才会触发退出。所以第 55–56 行能正常跑，我给的验证命令其实会打印 `reached`。抱歉。改成 `[ -n ] || unset` 仍然更直观，但这一条不是 bug。第 2 条（`PY_BIN="$(... || command -v python)"` 两个都找不到时，自定义报错不会输出）是成立的，因为赋值语句不在豁免范围内。
+
+下面结合完整的第 81 行和 `cascading.py` 再过一遍。
+
+## action.yml 第 81 行
+
+```
+"$PY_BIN" cascading.py -t ${{ inputs.token }} -r ${{ inputs.repo }} -b ${{ inputs.branch }} -d ${{ inputs.default_branch }} -v
+```
+
+- **`excluded_branches` 确认是死参数**：这里没传，`cascading.py` 的 argparse 里也没有对应参数。调用方传了也会被忽略，而且不会有任何报错。这是这个 PR 最大的功能缺口，分支名本身就是 `expand-cascade-merge`。
+- `-v` 写死了，每次运行都会把全部 release 分支列表打到日志里。可以改成只在开启 debug 时输出：`${RUNNER_DEBUG:+-v}`。
+- token 通过 argv 传入、`${{ }}` 没加引号，这两点和上一轮说的一样，仍然建议改。
+
+## cascading.py 的逻辑问题
+
+**1. release 分支的识别和截取不准确（第 93–94、127 行）**
+
+`re.search(r"release/", s)` 是在字符串任意位置匹配，`s.split('/', 2)[-1]` 取的是最后一段。所以：
+- `feature/release/foo` 会被当成 release 分支，截出版本号 `foo`；
+- `release/1.0/hotfix` 会被截成 `hotfix`，而不是 `1.0/hotfix`。
+
+第 116 行最后拼回 `"release/" + version`，可能得到一个并不存在的目标分支。第 92 行的 `re.sub('release/', '', ...)` 也没有锚定开头。三处都应改为 `startswith` 加 `removeprefix`。
+
+**2. `branch_compare` 返回值不一致，排序结果不确定（第 73–75 行）**
+
+两个分支的 token 逐个比较都相同、但字符串不同时，例如 `1.0` 和 `1-0`，或 `1.01` 和 `1.1`（`int` 后相等），循环会走完并在最后 `return -1`。这样 `compare(a,b)` 和 `compare(b,a)` 都返回 -1，违反了比较函数的约定，`sorted` 的结果取决于输入顺序。最后应该按长度判断：
+
+```python
+return -1 if len(tokens_b) > len(tokens_a) else 0
+```
+
+另外 `str.isnumeric()` 对 `²`、`½` 这类 Unicode 字符也返回 True，接着 `int()` 会抛异常。建议改用 `tok.isascii() and tok.isdigit()`。
+
+**3. `branch_name_token_prefix` 把 token 直接拼进正则（第 84–88 行）**
+
+token 没有经过 `re.escape`，分支名里出现 `(`、`$`、`^` 这类字符时正则会出错。另外，以分隔符开头的名字（例如 `-foo`）会让 `re.match` 返回 None，`.group()` 直接抛 `AttributeError`。
+
+**4. `sorted_versions.index(curr_branch)` 可能抛 ValueError（第 112 行）**
+
+当前分支没进入 `matched` 时就会抛异常，比如前缀计算不一致，或者以后它被 exclude 掉了。需要先检查，再给出明确的报错或直接退出。
+
+**5. 已有 PR 时不输出任何 outputs（第 162 行起）**
+
+`set_github_output` 只在新建 PR 时调用。如果上一次运行已经建了 PR 但 auto-merge 失败了，重跑时会发现"PR 已存在"，outputs 为空，Auto PR Merge 这一步就永远不会再触发。建议已存在的 PR 也输出 `pr_number`/`pr_url`，再加一个 `pr_created=true/false`。job summary 的标题 "PR Created" 也可以按这个值区分。
+
+**6. 查找已有 PR 是遍历全部 open PR（第 150–157 行）**
+
+被注释掉的第 149 行思路是对的。它当初大概是因为 `head` 必须写成 `owner:branch` 格式才没生效，不是 API 本身不行：
+
+```python
+existing = api.pulls.list(state="open", head=f"{owner}:{branch}", base=target_branch)
+```
+
+这样一次请求就够了，也顺带解决了 fork 中同名分支被误判的问题。
+
+**7. 次要项**
+
+- `paged(api.repos.list_branches)` 默认每页条数较少，传 `per_page=100` 能减少请求次数。`count` 变量没有用到。
+- 第 174–175 行用 `err.msg.split('\n')[2:]` 解析 fastcore 的错误文本，依赖它的格式，版本一升级就可能坏。建议包一层 try，失败时退回 `"No commits between" in str(err)`。
+- 第 182–183 行的 `except Exception: raise` 是多余的，可以删掉。
+- `exit(0)` 应改为 `sys.exit(0)`。前者来自 `site` 模块，用 `python -S` 运行时不存在。
+- `repo.split('/')` 改成 `split('/', 1)` 并解包，格式不对时能直接报错。
+- `arg_parser._action_groups.pop()` 用的是私有 API，Python 升级可能失效。
+
+## 建议改法
+
+```python
+import fnmatch
+import sys
+
+RELEASE_PREFIX = "release/"
+SEP = r"[_\-+.]+"
+
+def is_num(tok):
+    return tok.isascii() and tok.isdigit()
+
+def tokenize(branch):
+    return {'version': branch, 'tokens': re.split(SEP, branch)}
+
+def branch_compare(a, b):
+    if a == b:
+        return 0
+    ta, tb = tokenize(a)['tokens'], tokenize(b)['tokens']
+    for i, x in enumerate(ta):
+        if i >= len(tb) or not tb[i]:
+            return 1
+        y = tb[i]
+        if is_num(x) and is_num(y):
+            if int(x) != int(y):
+                return 1 if int(x) > int(y) else -1
+        elif is_num(x):
+            return 1
+        elif is_num(y):
+            return -1
+        elif x != y:
+            return 1 if x > y else -1
+    return -1 if len(tb) > len(ta) else 0
+
+def branch_name_token_prefix(branch):
+    parts = []
+    for tok in tokenize(branch)['tokens']:
+        if is_num(tok):
+            break
+        parts.append(re.escape(tok))
+    if not parts:
+        return ""
+    m = re.match(SEP.join(parts), branch)
+    return m.group() if m else ""
+
+def parse_patterns(s):
+    return [p.strip() for p in (s or "").split(",") if p.strip()]
+
+def is_excluded(branch, patterns):
+    # 支持 "release/1.*" 和 "1.*" 两种写法
+    short = branch.removeprefix(RELEASE_PREFIX)
+    return any(fnmatch.fnmatchcase(branch, p) or fnmatch.fnmatchcase(short, p)
+               for p in patterns)
+
+def determine_target_branch(all_branches, curr_branch, default_branch,
+                            excluded=(), verbose=False):
+    curr = curr_branch.removeprefix(RELEASE_PREFIX)
+    versions = [b[len(RELEASE_PREFIX):] for b in all_branches
+                if b.startswith(RELEASE_PREFIX)]
+    prefix = branch_name_token_prefix(curr)
+    matched = [v for v in versions
+               if branch_name_token_prefix(v) == prefix
+               and (v == curr or not is_excluded(RELEASE_PREFIX + v, excluded))]
+    sorted_versions = sorted(matched, key=cmp_to_key(branch_compare))
+    if verbose:
+        print(f"prefix: {prefix!r}\nmatched: {sorted_versions}")
+    if curr not in sorted_versions:
+        raise ValueError(f"{curr_branch} not found among release branches")
+    idx = sorted_versions.index(curr)
+    if idx + 1 < len(sorted_versions):
+        return RELEASE_PREFIX + sorted_versions[idx + 1]
+    return default_branch
+```
+
+`cascade_pr` 中对应的改动：
+
+```python
+def write_pr_outputs(pr, branch, target_branch, created):
+    set_github_output("pr_number", str(pr['number']))
+    set_github_output("pr_url", pr['html_url'])
+    set_github_output("source_branch", branch)
+    set_github_output("target_branch", target_branch)
+    set_github_output("pr_created", "true" if created else "false")
+
+def cascade_pr(token, repo, branch, default, excluded=(), verbose=False):
+    branch = branch.removeprefix("refs/heads/")
+    if not branch.startswith(RELEASE_PREFIX):
+        print("It's not a release branch. Exit.")
+        sys.exit(0)
+    if is_excluded(branch, excluded):
+        print(f"{branch} matches excluded_branches. Exit.")
+        sys.exit(0)
+
+    owner, name = repo.split("/", 1)
+    api = GhApi(owner=owner, repo=name, token=token)
+
+    all_branches = [b['name'] for page in paged(api.repos.list_branches, per_page=100)
+                    for b in page]
+    target_branch = determine_target_branch(all_branches, branch, default,
+                                            excluded, verbose=verbose)
+
+    existing = api.pulls.list(state="open", head=f"{owner}:{branch}", base=target_branch)
+    if existing:
+        if verbose:
+            print(f"PR #{existing[0]['number']} already exists")
+        write_pr_outputs(existing[0], branch, target_branch, created=False)
+        return
+
+    try:
+        pr = api.pulls.create(title=f"Cascading changes from {branch} to {target_branch}",
+                              body="Automatically created by cascading merge",
+                              head=branch, base=target_branch)
+    except HTTP422UnprocessableEntityError as err:
+        if "No commits between" in str(err):
+            print(f"No commits between {target_branch} and {branch}, no PR created.")
+            return
+        raise
+    write_pr_outputs(pr, branch, target_branch, created=True)
+```
+
+argparse 部分：
+
+```python
+optional.add_argument('-t', '--token', default=os.environ.get('GH_TOKEN'),
+                      help='GitHub token (defaults to $GH_TOKEN)')
+optional.add_argument('-e', '--exclude', default='',
+                      help='Comma-separated glob patterns, e.g. "release/1.*,release/legacy-*"')
+args = arg_parser.parse_args()
+if not args.token:
+    arg_parser.error("token required via -t or GH_TOKEN env")
+cascade_pr(args.token, args.repo, args.branch, args.default,
+           parse_patterns(args.exclude), args.verbose)
+```
+
+对应地，第 81 行改为（配合上一轮的 env 写法）：
+
+```bash
+"$PY_BIN" cascading.py -r "$REPO" -b "$BRANCH" -d "$DEFAULT_BRANCH" -e "$EXCLUDED_BRANCHES" ${RUNNER_DEBUG:+-v}
+```
+
+## 有两点需要你确认
+
+- **当前分支本身被 exclude 时怎么处理**：上面的写法是直接退出、不建 PR。如果你们希望"被排除的分支仍然往下级联、只是不作为目标"，把 `cascade_pr` 里那段 `is_excluded` 检查删掉即可。`determine_target_branch` 里已经保证当前分支不会被过滤掉。
+- `removeprefix` 需要 Python 3.9 及以上。如果持久化 runner 上的 Python 版本更低，改用 `b[len(RELEASE_PREFIX):] if b.startswith(...)`。
+
+`test_cascading.py` 里建议补几个用例：`branch_compare("1.0", "1-0") == 0`、`feature/release/x` 不被当成 release 分支、exclude 跳过中间版本后目标分支顺延、已有 PR 时 outputs 仍被写出。
