@@ -1,0 +1,149 @@
+name: 'Cascading Merge'
+description: 'Cascading release branch changes'
+
+inputs:
+  token:
+    description: 'GitHub access token'
+    required: true
+  repo:
+    description: 'GitHub repository name (owner/repo)'
+    required: true
+  branch:
+    description: 'Current release branch (e.g. release/1.2 or refs/heads/release/1.2)'
+    required: true
+  default_branch:
+    description: 'Final branch of cascading'
+    required: false
+    default: ${{ github.event.repository.default_branch }}
+  excluded_branches:
+    description: >-
+      Comma-separated glob patterns of branches to exclude from cascading merge,
+      matched against both "release/x" and "x" (e.g. "release/1.*,legacy-*")
+    required: false
+    default: ''
+  auto_merge_enabled:
+    description: 'Enable auto PR merge after cascading (true/false), set in caller workflow'
+    required: false
+    default: 'false'
+  venv_path:
+    description: >-
+      Path to a Python virtual environment to use on a persistent runner
+      (e.g. ~/devops-venv). Leave empty on ephemeral runners to install dependencies directly.
+    required: false
+    default: ''
+  pip_index_url:
+    description: 'Custom PyPI index URL (e.g. company Nexus pip proxy). Leave empty to use default.'
+    required: false
+    default: 'https://rp.td.com/repository/pypi-all/simple'
+  pip_trusted_host:
+    description: 'Host to mark as trusted for pip (used with an internal/HTTP index). Leave empty to disable.'
+    required: false
+    default: 'rp.td.com'
+
+outputs:
+  pr_number:
+    description: 'Cascading PR number (empty when no PR was created or found)'
+    value: ${{ steps.cascading_merge.outputs.pr_number }}
+  pr_url:
+    description: 'Cascading PR URL'
+    value: ${{ steps.cascading_merge.outputs.pr_url }}
+  pr_created:
+    description: '"true" if a new PR was created, "false" if an open PR already existed'
+    value: ${{ steps.cascading_merge.outputs.pr_created }}
+  source_branch:
+    description: 'Source branch of the cascading PR'
+    value: ${{ steps.cascading_merge.outputs.source_branch }}
+  target_branch:
+    description: 'Target branch of the cascading PR'
+    value: ${{ steps.cascading_merge.outputs.target_branch }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Debug info
+      if: runner.debug == '1'
+      shell: bash
+      run: |
+        pwd
+        echo "action_path: $GITHUB_ACTION_PATH"
+        echo "workspace:   $GITHUB_WORKSPACE"
+
+    - name: Cascading Merge
+      id: cascading_merge
+      shell: bash
+      env:
+        PIP_INDEX_URL: ${{ inputs.pip_index_url }}
+        PIP_TRUSTED_HOST: ${{ inputs.pip_trusted_host }}
+        VENV_PATH_IN: ${{ inputs.venv_path }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        BRANCH: ${{ inputs.branch }}
+        DEFAULT_BRANCH: ${{ inputs.default_branch }}
+        EXCLUDED_BRANCHES: ${{ inputs.excluded_branches }}
+      run: |
+        # Drop empty values so pip falls back to its defaults instead of an invalid index
+        [ -n "${PIP_INDEX_URL:-}" ]    || unset PIP_INDEX_URL
+        [ -n "${PIP_TRUSTED_HOST:-}" ] || unset PIP_TRUSTED_HOST
+
+        VENV_PATH="${VENV_PATH_IN/#\~/$HOME}"
+        if [ -n "$VENV_PATH" ]; then
+          # Persistent runner: use the caller-provided virtual environment
+          if [ ! -x "$VENV_PATH/bin/python" ]; then
+            echo "::error::venv_path='$VENV_PATH' has no executable bin/python. Create it or fix the path."
+            exit 1
+          fi
+          PY_BIN="$VENV_PATH/bin/python"
+        else
+          # Ephemeral runner: install dependencies directly, no venv needed
+          echo "No venv_path provided, installing dependencies directly (ephemeral runner)."
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [ -z "$PY_BIN" ]; then
+            echo "::error::No python3/python found on PATH"
+            exit 1
+          fi
+        fi
+
+        cd "$GITHUB_ACTION_PATH"
+        "$PY_BIN" -m pip install -q --disable-pip-version-check -r requirements.txt
+
+        # Token is read from $GH_TOKEN inside cascading.py (not passed via argv)
+        "$PY_BIN" cascading.py \
+          -r "$REPO" \
+          -b "$BRANCH" \
+          -d "$DEFAULT_BRANCH" \
+          -e "$EXCLUDED_BRANCHES" \
+          ${RUNNER_DEBUG:+-v}
+
+    - name: Publish PR link to job summary
+      if: steps.cascading_merge.outputs.pr_number != ''
+      shell: bash
+      env:
+        PR_NUMBER: ${{ steps.cascading_merge.outputs.pr_number }}
+        PR_URL: ${{ steps.cascading_merge.outputs.pr_url }}
+        PR_CREATED: ${{ steps.cascading_merge.outputs.pr_created }}
+        SOURCE_BRANCH: ${{ steps.cascading_merge.outputs.source_branch }}
+        TARGET_BRANCH: ${{ steps.cascading_merge.outputs.target_branch }}
+      run: |
+        if [ "$PR_CREATED" = "true" ]; then
+          TITLE="Cascading Merge PR Created"
+        else
+          TITLE="Cascading Merge PR Already Exists"
+        fi
+        {
+          echo "### $TITLE"
+          echo ""
+          echo "- **PR:** [#$PR_NUMBER]($PR_URL)"
+          echo "- **From:** \`$SOURCE_BRANCH\`"
+          echo "- **To:** \`$TARGET_BRANCH\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # Call Auto PR Merge as downstream
+    - name: Auto PR Merge
+      if: inputs.auto_merge_enabled == 'true' && steps.cascading_merge.outputs.pr_number != ''
+      # TODO: change to official action version after testing
+      uses: TD-Universe/common-actions/auto-pr-merge@v1
+      with:
+        token: ${{ inputs.token }}
+        repo: ${{ inputs.repo }}
+        pr_number: ${{ steps.cascading_merge.outputs.pr_number }}
+        default_branch: ${{ inputs.default_branch }}
