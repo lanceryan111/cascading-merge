@@ -399,4 +399,59 @@ step 里处理 venv 的部分改成：
 | 临时容器 | 不传参 | 直接安装依赖 |
 | 传了路径但不存在 | 传 `venv_path` | 报错，提示修正路径 |
 
+明白了：默认路径保持 `~/devops-venv`，运行时先检查，没有就当场创建。固定机器只在第一次运行时创建，之后一直复用；容器每次都会新建一个，开销只有几秒。
+
+**input 定义：**
+
+```yaml
+  venv_path:
+    description: >-
+      Path to the Python virtual environment. Created automatically if it does not exist
+      (reused on persistent runners, recreated on ephemeral/container runners).
+    required: false
+    default: '~/devops-venv'
+```
+
+**step 里处理 venv 的部分：**
+
+```bash
+        VENV_PATH="${VENV_PATH_IN/#\~/$HOME}"
+        if [ -z "$VENV_PATH" ]; then
+          echo "::error::venv_path must not be empty"
+          exit 1
+        fi
+
+        if [ -x "$VENV_PATH/bin/python" ]; then
+          echo "Using existing venv: $VENV_PATH"
+        else
+          SYS_PY="$(command -v python3 || command -v python || true)"
+          if [ -z "$SYS_PY" ]; then
+            echo "::error::No python3/python found on PATH to create venv"
+            exit 1
+          fi
+          echo "venv not found, creating: $VENV_PATH"
+          "$SYS_PY" -m venv "$VENV_PATH"
+        fi
+
+        PY_BIN="$VENV_PATH/bin/python"
+```
+
+后面不用改：
+
+```bash
+        cd "$GITHUB_ACTION_PATH"
+        "$PY_BIN" -m pip install -q --disable-pip-version-check -r requirements.txt
+        ...
+```
+
+依赖每次都会装到 venv 里。固定机器上依赖已经存在，这一步几秒就结束；新建的 venv 会完整安装一遍。
+
+**有三点需要注意：**
+
+1. **容器镜像里要有 venv 模块。** Debian/Ubuntu 系的镜像经常缺 `python3-venv` 包，`python3 -m venv` 会报 `ensurepip is not available`。可以先在容器里试一下 `python3 -m venv /tmp/t`。如果失败，要么在镜像里装上 `python3-venv`，要么告诉我，我加一段"创建失败就降级为直接安装"的逻辑。
+
+2. **固定机器上的并发。** 两个 job 同时在一台新机器上第一次运行时，可能同时创建同一个 venv。这种情况只会出现一次，概率很低。如果你们一台机器会跑多个并发 runner，可以给创建这一步加 `flock` 文件锁。
+
+3. **路径确认。** 你消息里写的是 `devops/venv`，我按之前的 `~/devops-venv` 写的。如果固定机器上 venv 的实际路径不同，把 `default` 改成那个路径，固定机器才会复用已有的 venv，否则会在新位置再建一个。
+
 有一个前提需要确认：固定机器上 venv 的实际位置要和 runner 账号的 `$HOME/devops-venv` 一致。如果那些机器的 venv 放在别的位置，比如 `/opt/devops-venv`，就把 `DEFAULT_VENV` 改成那个绝对路径。也可以依次检查多个候选路径，我可以帮你改成循环的写法。
