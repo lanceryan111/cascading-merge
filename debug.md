@@ -344,3 +344,59 @@ cascade_pr(args.token, args.repo, args.branch, args.default,
 - `removeprefix` 需要 Python 3.9 及以上。如果持久化 runner 上的 Python 版本更低，改用 `b[len(RELEASE_PREFIX):] if b.startswith(...)`。
 
 `test_cascading.py` 里建议补几个用例：`branch_compare("1.0", "1-0") == 0`、`feature/release/x` 不被当成 release 分支、exclude 跳过中间版本后目标分支顺延、已有 PR 时 outputs 仍被写出。
+
+那就用"自动探测"的写法，两种机器都不用改调用方：
+
+- `venv_path` 的默认值改回 `''`。
+- 没传 `venv_path` 时，先看 `~/devops-venv` 是否存在：存在就用（固定机器），不存在就直接安装依赖（容器）。
+- 显式传了 `venv_path` 但路径不存在时，仍然报错。调用方明确指定了路径，路径却不对，这种情况应该让它暴露出来。
+
+```yaml
+  venv_path:
+    description: >-
+      Path to a Python virtual environment. If empty, ~/devops-venv is used when it exists
+      (persistent runners); otherwise dependencies are installed directly (ephemeral/container runners).
+      An explicitly set path that does not exist fails the step.
+    required: false
+    default: ''
+```
+
+step 里处理 venv 的部分改成：
+
+```bash
+        DEFAULT_VENV="$HOME/devops-venv"
+        VENV_PATH="${VENV_PATH_IN/#\~/$HOME}"
+
+        if [ -n "$VENV_PATH" ]; then
+          # 显式指定：必须存在
+          if [ ! -x "$VENV_PATH/bin/python" ]; then
+            echo "::error::venv_path='$VENV_PATH' has no executable bin/python. Create it or fix the path."
+            exit 1
+          fi
+          PY_BIN="$VENV_PATH/bin/python"
+          echo "Using venv: $VENV_PATH"
+        elif [ -x "$DEFAULT_VENV/bin/python" ]; then
+          # 未指定，但固定机器上已有默认 venv
+          PY_BIN="$DEFAULT_VENV/bin/python"
+          echo "Using detected venv: $DEFAULT_VENV"
+        else
+          # 未指定且没有 venv：临时容器，直接安装依赖
+          echo "No venv found, installing dependencies directly (ephemeral runner)."
+          PY_BIN="$(command -v python3 || command -v python || true)"
+          if [ -z "$PY_BIN" ]; then
+            echo "::error::No python3/python found on PATH"
+            exit 1
+          fi
+        fi
+```
+
+各种情况的结果：
+
+| 场景 | 调用方 | 结果 |
+|---|---|---|
+| 固定机器，venv 在 `~/devops-venv` | 不传参 | 自动使用该 venv |
+| 固定机器，venv 在别的路径 | 传 `venv_path` | 使用指定路径 |
+| 临时容器 | 不传参 | 直接安装依赖 |
+| 传了路径但不存在 | 传 `venv_path` | 报错，提示修正路径 |
+
+有一个前提需要确认：固定机器上 venv 的实际位置要和 runner 账号的 `$HOME/devops-venv` 一致。如果那些机器的 venv 放在别的位置，比如 `/opt/devops-venv`，就把 `DEFAULT_VENV` 改成那个绝对路径。也可以依次检查多个候选路径，我可以帮你改成循环的写法。
